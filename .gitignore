@@ -1,0 +1,6 @@
+.env
+venv/
+posts.db
+bot.log
+*.session
+__pycache__/
