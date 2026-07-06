@@ -11,7 +11,27 @@ from bs4 import BeautifulSoup
 LIMIT = 4
 
 
-def merge_video_audio(video_bytes: bytes, audio_bytes: bytes) -> bytes:
+def _get_duration(path: str) -> float:
+    """Длительность медиафайла в секундах через ffprobe. 0.0 если не смогли определить."""
+    try:
+        result = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", path
+        ], capture_output=True, text=True, timeout=10)
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def merge_video_audio(video_bytes: bytes, audio_bytes: bytes):
+    """
+    Склеивает видео и аудио. Перед склейкой сверяет длительности: если
+    видео-дорожка заметно короче аудио (сеть на сервере медленнее локальной,
+    часть кусков видео не успела докачаться) — считаем результат битым и
+    возвращаем None, чтобы вызывающий код отправил вместо этого обложку,
+    а не рассинхронизированное видео.
+    Возвращает bytes при успехе, None при обнаруженном рассинхроне.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         v_path = os.path.join(tmpdir, "video.mp4")
         a_path = os.path.join(tmpdir, "audio.mp4")
@@ -20,13 +40,25 @@ def merge_video_audio(video_bytes: bytes, audio_bytes: bytes) -> bytes:
             f.write(video_bytes)
         with open(a_path, "wb") as f:
             f.write(audio_bytes)
+
+        v_dur = _get_duration(v_path)
+        a_dur = _get_duration(a_path)
+        if v_dur and a_dur:
+            print(f"  ⏱ длительность: видео {v_dur:.1f}s / аудио {a_dur:.1f}s")
+            # видео короче аудио больше чем на 15% — часть не докачалась,
+            # склейка даст рассинхрон. Лучше отправить обложку, чем брак.
+            if v_dur < a_dur * 0.85:
+                print(f"  ⚠️ видео заметно короче аудио — похоже на недокачку, "
+                      f"пропускаю видео (будет отправлена обложка)")
+                return None
+
         result = subprocess.run([
             "ffmpeg", "-y", "-i", v_path, "-i", a_path,
             "-c:v", "copy", "-c:a", "aac", "-shortest", out_path
         ], capture_output=True)
         if result.returncode != 0:
             print(f"  ⚠️ ffmpeg: {result.stderr[-300:]}")
-            return video_bytes
+            return None
         with open(out_path, "rb") as f:
             return f.read()
 
@@ -209,8 +241,10 @@ def _scrape(browser, cookies, limit):
             wait_for_network_quiet(
                 page,
                 size_fn=lambda: sum(len(c) for v in video_chunks.values() for c in v),
-                quiet_ms=2500,
-                max_ms=25000,
+                quiet_ms=3000,
+                max_ms=45000,  # увеличено с 25с — на сервере (Railway) сеть
+                # до CDN Instagram может быть медленнее, чем локально,
+                # раньше это обрезало видео на середине докачки
             )
             page.remove_listener("response", on_video_response)
         else:
@@ -232,7 +266,10 @@ def _scrape(browser, cookies, limit):
                     raw_audio = b"".join(a_streams[best_a])
                     print(f"  🔊 аудио: {len(raw_audio)//1024}KB — склеиваю...")
                     video_bytes = merge_video_audio(raw_video, raw_audio)
-                    print(f"  ✅ итого: {len(video_bytes)//1024}KB")
+                    if video_bytes:
+                        print(f"  ✅ итого: {len(video_bytes)//1024}KB")
+                    else:
+                        print(f"  📸 видео пропущено (рассинхрон) — уйдёт как обложка")
                 else:
                     video_bytes = raw_video
             elif video_chunks:
