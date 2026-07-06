@@ -155,6 +155,49 @@ DEBUG_IMAGES_JS = """
 """
 
 
+def _parse_content_range(headers: dict):
+    """
+    'bytes 0-1048575/5242880' -> (0, 1048575, 5242880).
+    Instagram отдаёт видео HTTP Range-запросами (браузер докачивает по
+    кусочкам во время буферизации/перемотки) — куски могут прилетать НЕ
+    по порядку и с повторами. Без этого заголовка нельзя понять, куда
+    именно в файле встаёт кусок, и склейка "в порядке прихода по сети"
+    даёт перемешанный/битый файл (обрезанное начало, выпавший звук и т.п.)
+    """
+    cr = headers.get("content-range", "")
+    m = re.match(r"bytes (\d+)-(\d+)/(\d+)", cr)
+    if not m:
+        return None
+    start, end, total = (int(x) for x in m.groups())
+    return start, end, total
+
+
+def _reconstruct_ranged_stream(parts: list, declared_total):
+    """
+    parts: список (start_byte, data) — куски, полученные в ЛЮБОМ порядке.
+    Сортируем по реальной позиции в файле и склеиваем. Если между кусками
+    остался пробел (кусок так и не докачался) — поток считается неполным
+    и возвращается None, чтобы вызывающий код ушёл на fallback (обложка),
+    а не отправил битое видео/аудио.
+    """
+    if not parts:
+        return None
+    parts = sorted(parts, key=lambda p: p[0])
+    buf = bytearray()
+    expected = 0
+    for start, data in parts:
+        if start > expected:
+            print(f"  ⚠️ пробел в байтах {expected}-{start} — поток неполный")
+            return None
+        overlap = expected - start  # дубль/пересечение с предыдущим куском
+        buf += data[overlap:] if overlap > 0 else data
+        expected = start + len(data)
+    if declared_total and expected < declared_total * 0.97:
+        print(f"  ⚠️ докачано {expected}/{declared_total} байт — поток неполный")
+        return None
+    return bytes(buf)
+
+
 def get_latest_posts(limit=LIMIT):
     cookies_path = Path("instagram_cookies.json")
     if not cookies_path.exists():
@@ -201,7 +244,8 @@ def _scrape(browser, cookies, limit):
         is_video = item["is_video"]
         print(f"\n{'🎬 Рилс' if is_video else '🖼  Пост'} {shortcode}")
 
-        video_chunks = {}
+        video_chunks = {}       # key -> [(start_byte, data), ...]
+        video_totals = {}       # key -> заявленный полный размер файла (из Content-Range)
 
         def on_video_response(response):
             url = response.url
@@ -214,10 +258,16 @@ def _scrape(browser, cookies, limit):
                 if len(data) == 0:
                     return
                 key = url.split("?")[0]
-                video_chunks.setdefault(key, []).append(data)
-                total = sum(len(c) for c in video_chunks[key])
+                cr = _parse_content_range(response.headers)
+                start = cr[0] if cr else 0
+                if cr:
+                    video_totals[key] = cr[2]
+                video_chunks.setdefault(key, []).append((start, data))
+                downloaded = sum(len(d) for _, d in video_chunks[key])
+                declared = video_totals.get(key)
                 stype = "video" if "/m86/" in url else ("audio" if "/m78/" in url else "other")
-                print(f"  🎬 {stype} {len(data)//1024}KB | total {total//1024}KB")
+                pct = f" ({downloaded/declared*100:.0f}%)" if declared else ""
+                print(f"  🎬 {stype} +{len(data)//1024}KB, байты {start}-{start+len(data)}{pct}")
             except:
                 pass
 
@@ -240,7 +290,7 @@ def _scrape(browser, cookies, limit):
                 pass
             wait_for_network_quiet(
                 page,
-                size_fn=lambda: sum(len(c) for v in video_chunks.values() for c in v),
+                size_fn=lambda: sum(len(d) for v in video_chunks.values() for _, d in v),
                 quiet_ms=3000,
                 max_ms=45000,  # увеличено с 25с — на сервере (Railway) сеть
                 # до CDN Instagram может быть медленнее, чем локально,
@@ -258,23 +308,32 @@ def _scrape(browser, cookies, limit):
             v_streams = {k: v for k, v in video_chunks.items() if "/m86/" in k}
             a_streams = {k: v for k, v in video_chunks.items() if "/m78/" in k}
             if v_streams:
-                best_v = max(v_streams, key=lambda k: sum(len(c) for c in v_streams[k]))
-                raw_video = b"".join(v_streams[best_v])
-                print(f"  🎬 видео: {len(raw_video)//1024}KB")
-                if a_streams:
-                    best_a = max(a_streams, key=lambda k: sum(len(c) for c in a_streams[k]))
-                    raw_audio = b"".join(a_streams[best_a])
-                    print(f"  🔊 аудио: {len(raw_audio)//1024}KB — склеиваю...")
-                    video_bytes = merge_video_audio(raw_video, raw_audio)
-                    if video_bytes:
-                        print(f"  ✅ итого: {len(video_bytes)//1024}KB")
-                    else:
-                        print(f"  📸 видео пропущено (рассинхрон) — уйдёт как обложка")
+                # Среди возможных ключей (разные качества/дорожки) берём тот,
+                # где реально докачано больше байт — но саму сборку делаем
+                # по позициям (Content-Range), а не по порядку прихода.
+                best_v = max(v_streams, key=lambda k: sum(len(d) for _, d in v_streams[k]))
+                raw_video = _reconstruct_ranged_stream(v_streams[best_v], video_totals.get(best_v))
+                if not raw_video:
+                    print(f"  📸 видео неполное/повреждённое — уйдёт как обложка")
                 else:
-                    video_bytes = raw_video
+                    print(f"  🎬 видео: {len(raw_video)//1024}KB")
+                    if a_streams:
+                        best_a = max(a_streams, key=lambda k: sum(len(d) for _, d in a_streams[k]))
+                        raw_audio = _reconstruct_ranged_stream(a_streams[best_a], video_totals.get(best_a))
+                        if not raw_audio:
+                            print(f"  📸 аудио неполное/повреждённое — уйдёт как обложка без звука")
+                        else:
+                            print(f"  🔊 аудио: {len(raw_audio)//1024}KB — склеиваю...")
+                            video_bytes = merge_video_audio(raw_video, raw_audio)
+                            if video_bytes:
+                                print(f"  ✅ итого: {len(video_bytes)//1024}KB")
+                            else:
+                                print(f"  📸 видео пропущено (рассинхрон) — уйдёт как обложка")
+                    else:
+                        video_bytes = raw_video
             elif video_chunks:
-                best = max(video_chunks, key=lambda k: sum(len(c) for c in video_chunks[k]))
-                video_bytes = b"".join(video_chunks[best])
+                best = max(video_chunks, key=lambda k: sum(len(d) for _, d in video_chunks[k]))
+                video_bytes = _reconstruct_ranged_stream(video_chunks[best], video_totals.get(best))
 
         # Caption
         caption = ""
