@@ -2,5 +2,6 @@
 venv/
 posts.db
 bot.log
-*.session
 __pycache__/
+*.session
+instagram_cookies.json
