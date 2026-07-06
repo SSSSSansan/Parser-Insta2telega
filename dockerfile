@@ -12,9 +12,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Ставим сам браузер Chromium + системные либы под него.
-# Это НЕ ставится через pip — отдельный шаг, без него Playwright
-# упадёт на сервере с ошибкой "executable doesn't exist".
-RUN playwright install --with-deps chromium
+# Явно указываем оба варианта: обычный chromium и chromium-headless-shell —
+# в headless=True режиме (как у нас в parser.py) Playwright использует
+# именно headless-shell, и его не всегда докачивает автоматически при
+# запросе просто "chromium". Без этого шага получаем ошибку на сервере:
+# "BrowserType.launch: Executable doesn't exist ... chrome-headless-shell".
+RUN playwright install --with-deps chromium chromium-headless-shell
 
 COPY . .
 
