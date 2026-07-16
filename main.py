@@ -13,7 +13,9 @@ logging.basicConfig(
 )
 
 # python3 main.py --dry-run  →  парсит и показывает что нашёл, но НЕ отправляет и НЕ пишет в БД
+# python3 main.py --once     →  одна проверка и выход (для GitHub Actions/cron)
 DRY_RUN = "--dry-run" in sys.argv
+ONCE = "--once" in sys.argv
 
 def check_and_send():
     logging.info("Проверяю новые посты...")
@@ -55,7 +57,7 @@ if __name__ == "__main__":
     init_db()
     check_and_send()
 
-    if not DRY_RUN:
+    if not DRY_RUN and not ONCE:
         schedule.every(30).minutes.do(check_and_send)
         while True:
             schedule.run_pending()

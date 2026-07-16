@@ -2,12 +2,13 @@ name: ESG Parser
 
 on:
   schedule:
-    - cron: '*/30 * * * *'   # каждые 30 минут
-  workflow_dispatch:          # чтобы можно было запускать вручную кнопкой
+    - cron: '0 */2 * * *'   # каждые 2 часа
+  workflow_dispatch:         # чтобы можно было запускать вручную кнопкой
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
 
@@ -25,13 +26,15 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
+      - name: Restore Instagram cookies
+        run: echo "${{ secrets.IG_COOKIES_B64 }}" | base64 -d > instagram_cookies.json
+
       - name: Run parser
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHANNEL_ID: ${{ secrets.TG_CHANNEL_ID }}
           IG_USERNAME: ${{ secrets.IG_USERNAME }}
-          IG_COOKIES_B64: ${{ secrets.IG_COOKIES_B64 }}
-        run: python main.py
+        run: python main.py --once
 
       - name: Save updated database back to repo
         run: |
