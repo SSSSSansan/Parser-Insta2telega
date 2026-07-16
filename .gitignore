@@ -6,3 +6,4 @@ __pycache__/
 *.session
 cookies_b64.txt
 instagram_cookies.json
+.DS_Store
